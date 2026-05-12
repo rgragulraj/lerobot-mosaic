@@ -61,6 +61,38 @@ lerobot-rollout --policy.path=<checkpoint> --robot.type=so101_follower ...  # On
 - **`docker/`** — `Dockerfile.user`, `Dockerfile.internal`, plus per-benchmark Dockerfiles (`Dockerfile.benchmark.*`) for LIBERO, MetaWorld, RoboCasa, RoboCerebra, RoboMME, RoboTwin, VLABench.
 - **Root files**: `pyproject.toml` (single source of truth for deps, build, tool config), `Makefile` (E2E test targets), `uv.lock`.
 
+## MOSAIC Project (`src/lerobot/mosaic/`)
+
+This repo is the base for **MOSAIC** (Modular Orchestrated Sub-Agent Architecture for Imitation-based Control), a hierarchical multi-agent system for robotic shape sorting. All MOSAIC code lives in `src/lerobot/mosaic/`.
+
+### Hardware
+
+- **Robot**: SO101 arm (Feetech STS3215 servos via `lerobot.motors.feetech`)
+- **Cameras**: overhead camera + gripper/wrist camera (both OpenCV)
+- **Force proxy**: no F/T sensor — gripper servo `Present_Load` register used to detect contact
+
+### Task
+
+Shape sorting: find a block, grasp it, navigate to the correct slot based on shape (rectangle, square, cross, star), insert it.
+
+### System Architecture
+
+- **Orchestrator**: GPT-4o agent using OpenAI tool calling. Sequences phases, receives success/fail signals, replans on failure.
+- **Policies**: Six ACT (Action Chunking with Transformers) checkpoints trained via LeRobot imitation learning:
+  - `grasp` — pick up the block
+  - `navigate_rectangle`, `navigate_square`, `navigate_cross`, `navigate_star` — move to the correct slot
+  - `insert` — place the block into the slot
+- **Shape detection**: GPT-4o vision on the overhead camera frame identifies the block shape.
+- **Phase termination**: four concurrent signals — fixed action-chunk count, servo load threshold, wall-clock timeout, GPT-4o vision check.
+- **Preprocessing**: CLAHE normalization (LAB L-channel) applied to all camera frames at both training and inference time to handle lighting variation.
+
+### Key Design Decisions
+
+- Custom inference loop (not `lerobot-rollout`) so MOSAIC can swap policies mid-episode and monitor phase completion.
+- Robot connected once; policies loaded on demand and cached.
+- Servo polling runs in a background thread to avoid blocking the control loop.
+- GPT-4o vision check triggered every N action chunks (not every step) to avoid latency impact.
+
 ## Notes
 
 - **Prioritize `uv run`** to execute Python commands (not raw `python` or `pip`).
