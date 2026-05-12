@@ -65,6 +65,7 @@ repos:
         name: Format Markdown with Prettier
         types_or: [markdown, mdx]
         args: [--prose-wrap=preserve]
+        language_version: system
 
   ##### Security #####
   - repo: https://github.com/gitleaks/gitleaks
@@ -76,6 +77,7 @@ repos:
     rev: v1.15.2
     hooks:
       - id: zizmor
+        args: ['--min-severity=high']
 
   - repo: https://github.com/PyCQA/bandit
     rev: 1.8.6
