@@ -1,0 +1,298 @@
+# MOSAIC — Project Context for Claude Code
+
+## What This Project Is
+
+MOSAIC (Modular Orchestrated Sub-Agent Architecture for Imitation-based Control) is a hierarchical multi-agent robotics system built as a first research paper. The task is shape sorting — a robot arm must find a block, pick it up, navigate to the correct slot based on its shape, and insert it. There are 4 shapes: circle, square, triangle, star.
+
+The core research contribution is the orchestrator and modular policy architecture. Instead of one end-to-end ACT policy trained on the full task, MOSAIC uses three specialized ACT policies sequenced by a GPT-4o orchestrator that can detect failures and replan. This is compared against a single end-to-end ACT baseline in evaluation.
+
+---
+
+## Hardware
+
+- **Robot arm:** SO101 manipulator
+- **Motors:** Feetech STS3215 servo motors — servo position is readable and used as a force proxy since there is no F/T sensor
+- **Cameras:** Overhead camera (workspace view) + gripper camera (close-up end effector view)
+- **No force/torque sensor** — all contact detection uses servo position thresholds
+
+---
+
+## Repo Structure
+
+The repo is a clone of the HuggingFace LeRobot repository renamed `lerobot-mosaic`. LeRobot is used as the base infrastructure for camera capture, robot control, ACT policy training, and dataset recording. All MOSAIC project code lives inside `src/lerobot/mosaic/` so it is importable as `lerobot.mosaic.*` alongside LeRobot internals.
+
+```
+lerobot-mosaic/
+├── src/
+│   └── lerobot/
+│       ├── mosaic/                  ← all MOSAIC code lives here
+│       │   ├── __init__.py
+│       │   ├── main.py
+│       │   ├── perception/
+│       │   │   ├── __init__.py
+│       │   │   └── gpt4v.py
+│       │   ├── orchestrator/
+│       │   │   ├── __init__.py
+│       │   │   ├── planner.py
+│       │   │   ├── tools.py
+│       │   │   └── replan.py
+│       │   ├── agents/
+│       │   │   ├── __init__.py
+│       │   │   ├── base_agent.py
+│       │   │   ├── grasp_agent.py
+│       │   │   ├── navigate_agent.py
+│       │   │   └── insert_agent.py
+│       │   ├── success_detector/
+│       │   │   ├── __init__.py
+│       │   │   ├── grasp_detector.py
+│       │   │   └── insert_detector.py
+│       │   ├── logger/
+│       │   │   ├── __init__.py
+│       │   │   └── trial_logger.py
+│       │   └── configs/
+│       │       └── mosaic.yaml
+│       │
+│       └── ...existing LeRobot code...
+│
+├── datasets/                        ← recorded LeRobot demonstration episodes
+├── checkpoints/                     ← trained ACT policy weights
+├── outputs/
+│   ├── logs/                        ← per-trial JSON logs
+│   └── results/                     ← aggregated paper metrics
+├── scripts/
+│   ├── collect_demos.sh
+│   ├── train_all.sh
+│   └── run_eval.sh
+└── .env                             ← OPENAI_API_KEY
+```
+
+---
+
+## Camera and Frame Processing
+
+**Raw frames only.** Both cameras output raw frames with no preprocessing. CLAHE was tested and made results worse on this hardware so it was removed. The raw frame from the overhead camera is used for both GPT-4V shape classification and as ACT policy input. The raw frame from the gripper camera is used as ACT policy input only.
+
+**Critical rule:** Training frames and inference frames must be identical. Whatever the camera outputs during demo recording is what the ACT policy sees at inference time. No preprocessing is applied at either stage.
+
+**Two uses of the overhead frame — never mixed:**
+- Raw frame → GPT-4V for shape classification (orchestrator layer)
+- Raw frame → ACT policy observation (agent layer)
+
+Both branches read from the same capture. The frame is never modified before going to ACT.
+
+---
+
+## The Three ACT Policies
+
+All policies are trained using LeRobot's ACT implementation on the SO101. Observations for all policies include overhead camera frame, gripper camera frame, and joint positions.
+
+### Policy 1 — Grasp Policy
+- **Trained on:** ~50 demonstrations of finding and picking up a block
+- **Start state:** Arm at home position, block somewhere in workspace
+- **End state:** Block held in gripper, arm lifted to carry height
+- **Varies across demos:** Block position across full workspace, all 4 shapes
+- **Checkpoint:** `checkpoints/grasp/`
+
+### Policy 2 — Navigate Policies (4 total, one per shape)
+- **Trained on:** ~50 demonstrations per shape (200 total)
+- **Start state:** Arm at carry height holding block
+- **End state:** Arm positioned directly above the correct slot, ready to insert
+- **Why separate per shape:** Each shape has a different target slot position. Training separate policies avoids shape conditioning complexity and keeps each policy simple and focused.
+- **Checkpoints:** `checkpoints/navigate_circle/`, `checkpoints/navigate_square/`, `checkpoints/navigate_triangle/`, `checkpoints/navigate_star/`
+
+### Policy 3 — Insert Policy
+- **Trained on:** ~50 demonstrations of inserting a block into a slot
+- **Start state:** Arm above slot holding block
+- **End state:** Block fully inserted, gripper released
+- **Training tip:** Include demos with slight misalignment and correction — ACT will learn the search/wiggle behavior needed for robust insertion
+- **Checkpoint:** `checkpoints/insert/`
+
+---
+
+## Full Trial Flow
+
+This is the exact sequence of events during one MOSAIC trial.
+
+### Phase 0 — Shape Identification
+1. Overhead camera captures one raw frame
+2. Frame sent to GPT-4V with shape classification prompt
+3. GPT-4V returns JSON: `{"shape": "triangle", "confidence": 0.95}`
+4. Shape label stored — used later to route to correct navigate policy
+5. Latency: ~1-2 seconds, happens once per trial
+
+### Phase 1 — Grasp
+1. Orchestrator calls `call_grasp_agent` tool
+2. Grasp agent captures fresh observation (overhead + gripper + joints)
+3. Grasp ACT policy runs full action chunk sequence
+4. Robot moves to block and attempts to pick it up
+5. **Success check:** STS3215 gripper servo position is read
+   - Fully open position: ~1000 (calibrate for your gripper)
+   - Fully closed position: ~200 (no object)
+   - Holding threshold: ~400 (between open and closed = holding something)
+   - If `200 < gripper_pos < 400` → success
+6. Result sent back to orchestrator: `{"success": true/false, "reason": "ok"/"slip"}`
+7. On fail: orchestrator retries grasp up to 3 times
+
+### Phase 2 — Navigate to Slot
+1. Orchestrator calls `call_navigate_agent` tool with shape label
+2. Navigate agent loads the shape-specific ACT policy (e.g. navigate_triangle)
+3. Policy runs full action chunk sequence
+4. Robot carries block from pickup position to above the correct slot
+5. **Success check:** GPT-4V takes one overhead frame and checks visually if the arm is positioned above the correct slot
+   - Prompt: "Is the robot arm now positioned directly above the [shape] slot? Return JSON: {success: bool}"
+6. Result sent back to orchestrator
+7. On fail: orchestrator retries navigate up to 3 times
+
+### Phase 3 — Insert
+1. Orchestrator calls `call_insert_agent` tool
+2. Insert agent captures fresh observation
+3. Insert ACT policy runs full action chunk sequence
+4. Robot pushes block down into slot
+5. **Success check:** Servo stall detection
+   - Send small downward push command
+   - Read joint positions before and after
+   - If movement < stall threshold → block hit slot bottom → success
+   - If movement > stall threshold → block missed slot → fail
+6. Result sent back to orchestrator: `{"success": true/false, "reason": "ok"/"misalign"}`
+7. On fail: orchestrator retries insert up to 3 times
+
+### Trial End
+1. All three phases passed → orchestrator receives final success
+2. Logger writes full trial JSON to `outputs/logs/trial_XXXX.json`
+3. Robot returns to home position
+4. Ready for next trial
+
+---
+
+## Orchestrator Design
+
+The orchestrator is a GPT-4o agent using tool calling. It receives the scene state (shape label) and sequences the three agents by calling their corresponding tools. After each tool call it receives a success or fail result and decides what to do next.
+
+**Why GPT-4o for orchestration:** The LLM handles sequencing logic, retry decisions, and replanning naturally through its tool calling loop without needing a hand-coded state machine. The system prompt describes the task and constraints, and the model figures out the correct sequence.
+
+**Tools defined:**
+- `call_grasp_agent()` — no parameters
+- `call_navigate_agent(shape: str)` — takes shape label
+- `call_insert_agent()` — no parameters
+
+**System prompt tells the orchestrator:**
+- Always run grasp first, then navigate, then insert
+- Pass shape label to navigate agent
+- On failure retry up to 3 times
+- If retries exhausted log as failed trial and stop
+
+---
+
+## Replan Logic
+
+When a phase fails the orchestrator receives a structured failure report and applies a replan policy.
+
+| Failure reason | Action |
+|---|---|
+| `slip` | Retry grasp — block was dropped |
+| `misalign` | Retry insert directly — block still in gripper |
+| `nav_fail` | Retry navigate — block still in gripper |
+| `no_block` | Full restart from grasp |
+
+Max retries per phase: 3. If exceeded, abort trial and log as failed.
+
+---
+
+## Success Detection
+
+No F/T sensor. Two detection methods used depending on phase.
+
+**Servo position threshold (grasp):**
+Read STS3215 gripper servo position after policy completes. Position between fully-closed and open-threshold means object is held. Calibrate thresholds on your hardware before running trials.
+
+**Servo stall detection (insert):**
+Send a small downward push action after policy completes. Measure joint movement. Below stall threshold means the block is seated and the arm cannot move further down. Above threshold means the block missed.
+
+**GPT-4V visual check (navigate):**
+Single overhead frame sent to GPT-4V after navigate policy completes. Asks if arm is above the correct slot. Used here because there is no physical signal that confirms spatial positioning.
+
+---
+
+## Trial Logger
+
+Every trial writes a JSON log file to `outputs/logs/`. Schema:
+
+```json
+{
+  "trial_id": 42,
+  "timestamp": "2025-05-08T14:23:11",
+  "system": "mosaic",
+  "shape": "triangle",
+  "perception": {
+    "shape_detected": "triangle",
+    "confidence": 0.95,
+    "latency_ms": 1240
+  },
+  "grasp": {
+    "attempts": 1,
+    "success": true,
+    "reason": "ok",
+    "latency_ms": 3100
+  },
+  "navigate": {
+    "attempts": 1,
+    "success": true,
+    "reason": "ok",
+    "latency_ms": 4200
+  },
+  "insert": {
+    "attempts": 2,
+    "success": true,
+    "reason": "misalign",
+    "latency_ms": 5800
+  },
+  "outcome": {
+    "success": true,
+    "total_retries": 1,
+    "total_ms": 14340
+  }
+}
+```
+
+---
+
+## Paper Metrics
+
+Run 20 trials per shape for both MOSAIC and the single ACT baseline (80 trials each, 160 total).
+
+| Metric | Description |
+|---|---|
+| Overall task success rate | % trials where block correctly inserted |
+| Per-shape success rate | Breakdown by circle/square/triangle/star |
+| Recovery rate | % of failure cases where replanning led to success |
+| Average retries per trial | How often replanning was needed |
+| Average time to completion | Total ms including retries |
+
+The key comparison is recovery rate — the baseline single ACT policy gets zero recoveries because it has no replanning. MOSAIC recovers from mid-task failures. This is the central claim of the paper.
+
+---
+
+## Key Implementation Rules
+
+1. **Never preprocess frames before ACT.** Raw frames only. Training and inference must match exactly.
+2. **Never draw overlays on frames going to ACT.** Debug visualizations go on copies only.
+3. **Capture observation once per timestep.** Do not open the camera twice. One `robot.capture_observation()` call, reuse the dict everywhere.
+4. **Log everything from day one.** Every trial, every phase, every retry. This data is your paper results.
+5. **Calibrate servo thresholds on your hardware before evaluation.** The numbers in this doc are starting points not ground truth.
+6. **Test each agent in isolation before wiring the orchestrator.** Grasp alone, navigate alone, insert alone, then full pipeline.
+
+---
+
+## Current Status
+
+- [x] Repo cloned and renamed lerobot-mosaic
+- [x] Camera preprocessing decision made — raw frames
+- [ ] GPT-4V shape classification — gpt4v.py
+- [ ] Orchestrator — planner.py, tools.py, replan.py
+- [ ] Grasp agent — demo collection + training + agent wrapper
+- [ ] Navigate agents — demo collection + training + agent wrapper
+- [ ] Insert agent — demo collection + training + agent wrapper
+- [ ] Success detectors
+- [ ] Trial logger
+- [ ] Evaluation harness
+- [ ] Baseline comparison
