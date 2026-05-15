@@ -82,29 +82,87 @@ Both branches read from the same capture. The frame is never modified before goi
 
 ---
 
+## Data Collection Protocol
+
+Episodes are recorded as **full end-to-end demonstrations** — home position → grasp → navigate → insert — in one continuous recording. Keyframe annotations mark the two transition points. A post-processing script then splits each full episode into three sub-episodes, one per policy.
+
+**Why full episodes instead of separate phase demos:**
+- More natural to teleoperate — no stopping and resetting between phases
+- Start/end states of each sub-policy are guaranteed to be consistent with each other
+- One teleoperation session yields three training examples
+- Transition states (e.g. carry height after grasp) are learned from real continuations, not artificial resets
+
+### Recording a Demo
+
+1. Arm starts at home position, block placed somewhere in workspace
+2. Start recording: `bash scripts/record_session_a.sh` (or equivalent)
+3. Teleoperate the full task:
+   - Pick up the block from anywhere in the workspace
+   - Lift it to carry height
+   - **Press `k`** → marks Keyframe 1 (grasp complete)
+   - Navigate to the correct slot above it
+   - **Press `k`** → marks Keyframe 2 (navigate complete)
+   - Insert the block into the slot
+   - End the episode (spacebar or configured stop key)
+4. Repeat for all 4 shapes, varying block position each time
+
+### Keyframe Annotation
+
+Two keyframes are pressed per episode:
+
+| Keyframe | When to press | Marks |
+|---|---|---|
+| KF1 | Block is in gripper, arm lifted to carry height | End of grasp phase |
+| KF2 | Arm is positioned directly above the correct slot | End of navigate phase |
+
+Keyframe timestamps are stored as metadata on the episode. The split script uses them as slice boundaries.
+
+### Dataset Split
+
+After recording, run the split script to generate three training datasets from one:
+
+```
+full episode [frame 0 → frame N]
+     │
+     ├── [0  → KF1]  → datasets/grasp/
+     ├── [KF1→ KF2]  → datasets/navigate_<shape>/
+     └── [KF2→ N  ]  → datasets/insert/
+```
+
+Script: `scripts/split_episodes.py` (reads keyframe metadata, writes three LeRobotDataset splits)
+
+### Demo Targets
+
+- **50 full episodes per shape** → 50 grasp demos + 50 navigate demos per shape + 50 insert demos
+- **200 full episodes total** (50 × 4 shapes)
+- Vary block position across the full workspace on every episode
+- Include episodes with slight misalignment before insert — ACT will learn the search/wiggle correction
+
+---
+
 ## The Three ACT Policies
 
-All policies are trained using LeRobot's ACT implementation on the SO101. Observations for all policies include overhead camera frame, gripper camera frame, and joint positions.
+All policies are trained using LeRobot's ACT implementation on the SO101. Observations for all policies include overhead camera frame, gripper camera frame, and joint positions. All training data comes from splitting full end-to-end episodes at keyframe boundaries (see Data Collection Protocol above).
 
 ### Policy 1 — Grasp Policy
-- **Trained on:** ~50 demonstrations of finding and picking up a block
+- **Trained on:** Frames 0 → KF1 from all 200 full episodes (all shapes)
 - **Start state:** Arm at home position, block somewhere in workspace
 - **End state:** Block held in gripper, arm lifted to carry height
 - **Varies across demos:** Block position across full workspace, all 4 shapes
 - **Checkpoint:** `checkpoints/grasp/`
 
 ### Policy 2 — Navigate Policies (4 total, one per shape)
-- **Trained on:** ~50 demonstrations per shape (200 total)
+- **Trained on:** Frames KF1 → KF2 from the 50 episodes for that shape
 - **Start state:** Arm at carry height holding block
 - **End state:** Arm positioned directly above the correct slot, ready to insert
 - **Why separate per shape:** Each shape has a different target slot position. Training separate policies avoids shape conditioning complexity and keeps each policy simple and focused.
 - **Checkpoints:** `checkpoints/navigate_circle/`, `checkpoints/navigate_square/`, `checkpoints/navigate_triangle/`, `checkpoints/navigate_star/`
 
 ### Policy 3 — Insert Policy
-- **Trained on:** ~50 demonstrations of inserting a block into a slot
+- **Trained on:** Frames KF2 → end from all 200 full episodes (all shapes)
 - **Start state:** Arm above slot holding block
 - **End state:** Block fully inserted, gripper released
-- **Training tip:** Include demos with slight misalignment and correction — ACT will learn the search/wiggle behavior needed for robust insertion
+- **Note:** Because insert demos come from all 4 shapes, the policy sees varied slot approach angles — this improves robustness naturally.
 - **Checkpoint:** `checkpoints/insert/`
 
 ---
@@ -280,6 +338,8 @@ The key comparison is recovery rate — the baseline single ACT policy gets zero
 4. **Log everything from day one.** Every trial, every phase, every retry. This data is your paper results.
 5. **Calibrate servo thresholds on your hardware before evaluation.** The numbers in this doc are starting points not ground truth.
 6. **Test each agent in isolation before wiring the orchestrator.** Grasp alone, navigate alone, insert alone, then full pipeline.
+7. **Press keyframes deliberately, not reactively.** KF1 should be pressed when the arm is stable at carry height — not mid-motion. A sloppy keyframe creates a bad sub-episode boundary for both adjacent policies.
+8. **Run split_episodes.py before training.** Never train directly on full episodes. The split script is the source of truth for all three datasets.
 
 ---
 
@@ -287,12 +347,16 @@ The key comparison is recovery rate — the baseline single ACT policy gets zero
 
 - [x] Repo cloned and renamed lerobot-mosaic
 - [x] Camera preprocessing decision made — raw frames
-- [ ] GPT-4V shape classification — gpt4v.py
-- [ ] Orchestrator — planner.py, tools.py, replan.py
-- [ ] Grasp agent — demo collection + training + agent wrapper
-- [ ] Navigate agents — demo collection + training + agent wrapper
-- [ ] Insert agent — demo collection + training + agent wrapper
-- [ ] Success detectors
-- [ ] Trial logger
-- [ ] Evaluation harness
-- [ ] Baseline comparison
+- [x] Data collection strategy — full episodes with keyframe annotation + split
+- [x] GPT-4V shape classification — `perception/gpt4v.py`
+- [ ] Keyframe annotation — modify recording script to capture `k` keypresses as episode metadata
+- [ ] Dataset split script — `scripts/split_episodes.py`
+- [ ] Trial logger — `logger/trial_logger.py`
+- [ ] Orchestrator — `orchestrator/planner.py`, `tools.py`, `replan.py`
+- [ ] Success detectors — `success_detector/grasp_detector.py`, `insert_detector.py`
+- [ ] Agents — `agents/base_agent.py`, `grasp_agent.py`, `navigate_agent.py`, `insert_agent.py`
+- [ ] Demo collection (hardware) — 200 full episodes, 50 per shape
+- [ ] Dataset splitting — run split_episodes.py, verify sub-episode boundaries
+- [ ] ACT training — train grasp, navigate ×4, insert policies
+- [ ] Evaluation harness — `main.py` + eval loop
+- [ ] Baseline comparison — single end-to-end ACT policy
