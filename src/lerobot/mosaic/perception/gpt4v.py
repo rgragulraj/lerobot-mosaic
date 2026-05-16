@@ -22,22 +22,25 @@ from openai import OpenAI
 
 load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 
-SHAPES = ("circle", "square", "triangle", "star")
-ShapeLabel = Literal["circle", "square", "triangle", "star"]
+SHAPES = ("square", "rectangle", "star", "cross")
+ShapeLabel = Literal["square", "rectangle", "star", "cross"]
 
 _CLASSIFY_PROMPT = """You are a shape classifier for a robotic sorting task.
 The image shows a top-down view of a workspace with one block visible.
-The block will be one of these four shapes: circle, square, triangle, star.
+The block will be one of these four shapes: square, rectangle, star, cross.
 
 Respond ONLY with valid JSON in this exact format:
-{"shape": "<shape>", "confidence": <0.0-1.0>}
+{"shape": "<shape>", "confidence": <0.0-1.0>, "bbox": [x1, y1, x2, y2]}
 
-Where <shape> is one of: circle, square, triangle, star.
+Where <shape> is one of: square, rectangle, star, cross.
+bbox is the bounding box of the block as normalized coordinates (0.0-1.0):
+  x1, y1 = top-left corner
+  x2, y2 = bottom-right corner
 Do not include any other text."""
 
 _NAVIGATE_PROMPT = """You are a robotic arm position checker.
 The image shows a top-down view of a workspace with a robot arm holding a block.
-The workspace has slots for four shapes: circle, square, triangle, star.
+The workspace has slots for four shapes: square, rectangle, star, cross.
 
 Task: Determine whether the robot arm is positioned directly above the {shape} slot.
 
@@ -108,7 +111,7 @@ class GPT4VClient:
 
         Args:
             frame: Raw BGR frame from the overhead camera. No preprocessing applied.
-            shape: Target shape label, e.g. "triangle".
+            shape: Target shape label, e.g. "cross".
 
         Returns:
             {"success": bool, "latency_ms": int}

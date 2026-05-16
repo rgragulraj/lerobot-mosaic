@@ -1,43 +1,69 @@
 """
-MOSAIC data collection script.
+MOSAIC data collection script with real-time keyframe annotation.
 
-Interactive wrapper around lerobot-record that:
-  - Records one episode at a time for a chosen shape
-  - Prompts for quality rating and notes after each episode
-  - Logs metadata via DataCollectionLogger
-  - Shows running progress toward the 50-per-shape target
+Records one episode at a time for a chosen shape, prompts for quality rating and
+notes after each episode, logs metadata via DataCollectionLogger, and shows running
+progress toward the 50-per-shape target.
+
+Controls during recording:
+  k          → mark keyframe (first press = KF1 grasp done, second = KF2 navigate done)
+  right →    → save episode and begin reset window
+  left  ←    → discard episode and re-record
+  Escape     → stop session
 
 Usage:
-    uv run python scripts/collect_data.py --shape circle
-    uv run python scripts/collect_data.py          # interactive shape selection
-
-Controls during recording (lerobot-record hotkeys):
-    Right arrow  →   save episode and begin reset window
-    Left  arrow  ←   discard episode and re-record
-    Escape           stop session early
+    uv run python scripts/collect_data.py --shape square
+    uv run python scripts/collect_data.py         # interactive shape selection
+    uv run python scripts/collect_data.py --shape cross --num-episodes 10
 """
 
 import argparse
-import json
-import subprocess
+import logging
 import sys
+import time
 from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-from lerobot.mosaic.logger import DataCollectionLogger
-from lerobot.mosaic.logger.data_collection_logger import SHAPES, Quality, Shape
 
-# ── Hardware defaults (edit here or override via CLI flags) ─────────────────
+from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401 — triggers registry
+from lerobot.common.control_utils import sanity_check_dataset_robot_compatibility
+from lerobot.datasets import (
+    LeRobotDataset,
+    VideoEncodingManager,
+    aggregate_pipeline_dataset_features,
+    create_initial_features,
+    safe_stop_image_writer,
+)
+from lerobot.mosaic.logger import DataCollectionLogger
+from lerobot.mosaic.logger.data_collection_logger import SHAPES, Shape
+from lerobot.processor import make_default_processors
+from lerobot.robots import (
+    make_robot_from_config,
+    so_follower,  # noqa: F401 — registers so101_follower
+)
+from lerobot.robots.config import RobotConfig
+from lerobot.teleoperators import (
+    make_teleoperator_from_config,
+    so_leader,  # noqa: F401 — registers so101_leader
+)
+from lerobot.teleoperators.config import TeleoperatorConfig
+from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
+from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.utils import init_logging, log_say
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+
+# ── Hardware defaults ────────────────────────────────────────────────────────
 FOLLOWER_PORT = "/dev/ttyACM0"
 LEADER_PORT = "/dev/ttyACM1"
 ROBOT_ID = "vellai_kunjan"
-OVERHEAD_CAM_IDX = "/dev/video5"
-GRIPPER_CAM_IDX = "/dev/video7"
+OVERHEAD_CAM_IDX = "/dev/video7"
+GRIPPER_CAM_IDX = "/dev/video5"
 FPS = 30
-EPISODE_TIME_S = 60  # seconds the operator has to complete the full demo
-RESET_TIME_S = 30  # seconds between episodes to reposition
-# ───────────────────────────────────────────────────────────────────────────
+EPISODE_TIME_S = 60
+RESET_TIME_S = 30
+# ────────────────────────────────────────────────────────────────────────────
 
 HF_USER = "rgragulraj"
 
@@ -59,32 +85,157 @@ def pick_shape() -> Shape:
         print("  Invalid. Try again.")
 
 
-def prompt_quality() -> Quality:
-    while True:
-        raw = input("  Keep this episode? [Y/n]: ").strip().lower()
-        if raw in ("", "y"):
-            return "good"
-        if raw == "n":
-            return "discard"
-        print("  Enter Y or N.")
+def _make_events() -> dict:
+    return {
+        "exit_early": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+        "keyframe_pressed": False,
+        "keyframes": [],
+    }
 
 
-def read_last_episode_frames(shape: str) -> int | None:
-    """Read the frame count of the most recently saved episode from dataset metadata."""
-    episodes_path = Path(f"datasets/raw_{shape}/meta/episodes.jsonl")
-    if not episodes_path.exists():
-        return None
-    lines = episodes_path.read_text().strip().splitlines()
-    if not lines:
-        return None
+def _start_keyboard_listener(events: dict):
+    """Start a background thread that reads raw keypresses from stdin. Works on Wayland and X11."""
+    import select
+    import termios
+    import threading
+    import tty
+
+    fd = sys.stdin.fileno()
     try:
-        last = json.loads(lines[-1])
-        return last.get("length")
-    except Exception:
+        old_settings = termios.tcgetattr(fd)
+    except termios.error:
+        logging.warning("Cannot read terminal settings — keyboard input unavailable.")
         return None
+
+    def read_keys():
+        tty.setraw(fd)
+        try:
+            while not events.get("_kb_stop"):
+                if select.select([sys.stdin], [], [], 0.05)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch == "k":
+                        kf_num = len(events["keyframes"]) + 1
+                        events["keyframe_pressed"] = True
+                        print(f"\n  [k] Keyframe {kf_num} queued...")
+                    elif ch == "\x1b":  # escape sequence start
+                        # check for arrow keys: ESC [ A/B/C/D
+                        if select.select([sys.stdin], [], [], 0.2)[0]:
+                            ch2 = sys.stdin.read(1)
+                            if ch2 == "[" and select.select([sys.stdin], [], [], 0.2)[0]:
+                                ch3 = sys.stdin.read(1)
+                                if ch3 == "C":
+                                    print("\nRight arrow → saving episode...")
+                                    events["exit_early"] = True
+                                elif ch3 == "D":
+                                    print("\nLeft arrow → discarding episode, will re-record...")
+                                    events["rerecord_episode"] = True
+                                    events["exit_early"] = True
+                            else:
+                                # plain ESC
+                                print("\nEscape → stopping session.")
+                                events["stop_recording"] = True
+                                events["exit_early"] = True
+                        else:
+                            # plain ESC (no follow-up bytes)
+                            print("\nEscape → stopping session.")
+                            events["stop_recording"] = True
+                            events["exit_early"] = True
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    events["_kb_stop"] = False
+    t = threading.Thread(target=read_keys, daemon=True)
+    t.start()
+    return t
+
+
+@safe_stop_image_writer
+def _record_episode(
+    robot,
+    teleop,
+    dataset: LeRobotDataset,
+    events: dict,
+    fps: int,
+    episode_time_s: int,
+    single_task: str,
+    display_data: bool,
+) -> list[int]:
+    """Run one episode recording loop. Returns list of keyframe frame indices captured."""
+    events["exit_early"] = False
+    events["keyframe_pressed"] = False
+    events["keyframes"] = []
+
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+
+    control_interval = 1.0 / fps
+    frame_index = 0
+    start_t = time.perf_counter()
+
+    while (time.perf_counter() - start_t) < episode_time_s:
+        loop_start = time.perf_counter()
+
+        if events["exit_early"]:
+            events["exit_early"] = False
+            break
+
+        obs = robot.get_observation()
+        obs_processed = robot_observation_processor(obs)
+        observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+
+        act = teleop.get_action()
+        act_teleop = teleop_action_processor((act, obs))
+        robot_action_to_send = robot_action_processor((act_teleop, obs))
+        robot.send_action(robot_action_to_send)
+
+        action_frame = build_dataset_frame(dataset.features, act_teleop, prefix=ACTION)
+        dataset.add_frame({**observation_frame, **action_frame, "task": single_task})
+
+        if display_data:
+            log_rerun_data(observation=obs_processed, action=act_teleop)
+
+        if events["keyframe_pressed"]:
+            events["keyframe_pressed"] = False
+            events["keyframes"].append(frame_index)
+            kf_num = len(events["keyframes"])
+            label = "KF1 (grasp done)" if kf_num == 1 else "KF2 (navigate done)"
+            print(f"  Keyframe {kf_num} captured at frame {frame_index}  [{label}]")
+
+        frame_index += 1
+        dt = time.perf_counter() - loop_start
+        precise_sleep(max(0.0, control_interval - dt))
+
+    return list(events["keyframes"])
+
+
+def _reset_window(robot, teleop, events: dict, fps: int, reset_time_s: int):
+    """Run reset window — robot moves but nothing is recorded."""
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    control_interval = 1.0 / fps
+    start_t = time.perf_counter()
+
+    while (time.perf_counter() - start_t) < reset_time_s:
+        loop_start = time.perf_counter()
+
+        if events["exit_early"]:
+            events["exit_early"] = False
+            break
+
+        obs = robot.get_observation()
+        robot_observation_processor(obs)
+        act = teleop.get_action()
+        act_teleop = teleop_action_processor((act, obs))
+        robot_action_to_send = robot_action_processor((act_teleop, obs))
+        robot.send_action(robot_action_to_send)
+
+        dt = time.perf_counter() - loop_start
+        precise_sleep(max(0.0, control_interval - dt))
 
 
 def dataset_episode_count(shape: str) -> int:
+    import json
+
     info_path = Path(f"datasets/raw_{shape}/meta/info.json")
     if not info_path.exists():
         return 0
@@ -94,61 +245,47 @@ def dataset_episode_count(shape: str) -> int:
         return 0
 
 
-def build_record_cmd(
-    shape: str,
-    follower_port: str,
-    leader_port: str,
-    robot_id: str,
-    overhead_cam: int,
-    gripper_cam: int,
-    fps: int,
-    episode_time_s: int,
-    reset_time_s: int,
-    resume: bool,
-) -> list[str]:
-    # YAML-style dict — matches the format expected by draccus/OmegaConf CLI parsing.
-    # index_or_path is quoted when it's a device path string (e.g. /dev/video5).
-    def cam_path(v) -> str:
-        return f'"{v}"' if isinstance(v, str) else str(v)
+def read_last_episode_frames(shape: str) -> int | None:
+    import json
 
-    cameras = (
-        f"{{overhead: {{type: opencv, index_or_path: {cam_path(overhead_cam)},"
-        f" width: 640, height: 480, fps: {fps}}},"
-        f" gripper: {{type: opencv, index_or_path: {cam_path(gripper_cam)},"
-        f" width: 640, height: 480, fps: {fps}}}}}"
+    path = Path(f"datasets/raw_{shape}/meta/episodes.jsonl")
+    if not path.exists():
+        return None
+    lines = path.read_text().strip().splitlines()
+    if not lines:
+        return None
+    try:
+        return json.loads(lines[-1]).get("length")
+    except Exception:
+        return None
+
+
+def build_robot_config(follower_port: str, robot_id: str, overhead_cam, gripper_cam, fps: int) -> RobotConfig:
+    from lerobot.robots.so_follower.config_so_follower import SO101FollowerConfig
+
+    def cam_cfg(idx):
+        return OpenCVCameraConfig(index_or_path=idx, width=640, height=480, fps=fps)
+
+    cfg = SO101FollowerConfig(
+        port=follower_port,
+        cameras={"overhead": cam_cfg(overhead_cam), "gripper": cam_cfg(gripper_cam)},
     )
-    cmd = [
-        "uv",
-        "run",
-        "lerobot-record",
-        "--robot.type=so101_follower",
-        f"--robot.port={follower_port}",
-        f"--robot.id={robot_id}",
-        f"--robot.cameras={cameras}",
-        "--teleop.type=so101_leader",
-        f"--teleop.port={leader_port}",
-        f"--dataset.repo_id={HF_USER}/mosaic_raw_{shape}",
-        f"--dataset.root=datasets/raw_{shape}",
-        "--dataset.num_episodes=1",
-        f"--dataset.single_task=Sort {shape} block",
-        f"--dataset.fps={fps}",
-        f"--dataset.episode_time_s={episode_time_s}",
-        f"--dataset.reset_time_s={reset_time_s}",
-        "--dataset.push_to_hub=false",
-        "--dataset.video=true",
-        "--dataset.vcodec=auto",  # auto-selects best available hardware encoder
-        "--dataset.streaming_encoding=true",  # encode frames in real-time → save_episode() is near-instant
-        "--dataset.encoder_threads=4",
-        "--dataset.num_image_writer_threads_per_camera=4",
-        "--display_data=true",
-    ]
-    if resume:
-        cmd.append("--resume=true")
-    return cmd
+    cfg.id = robot_id
+    return cfg
+
+
+def build_teleop_config(leader_port: str) -> TeleoperatorConfig:
+    from lerobot.teleoperators.so_leader.config_so_leader import SO101LeaderConfig
+
+    cfg = SO101LeaderConfig(port=leader_port)
+    cfg.id = "my_leader_arm"
+    return cfg
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MOSAIC data collection")
+    init_logging()
+
+    parser = argparse.ArgumentParser(description="MOSAIC data collection with live keyframe annotation")
     parser.add_argument("--shape", choices=SHAPES)
     parser.add_argument("--follower-port", default=FOLLOWER_PORT)
     parser.add_argument("--leader-port", default=LEADER_PORT)
@@ -158,10 +295,8 @@ def main() -> None:
     parser.add_argument("--fps", type=int, default=FPS)
     parser.add_argument("--episode-time", type=int, default=EPISODE_TIME_S)
     parser.add_argument("--reset-time", type=int, default=RESET_TIME_S)
-    parser.add_argument(
-        "--num-episodes", type=int, default=0, help="Episodes to record this session (prompted if omitted)"
-    )
-    parser.add_argument("--operator", default="", help="Your name (logged per session)")
+    parser.add_argument("--num-episodes", type=int, default=0)
+    parser.add_argument("--operator", default="")
     args = parser.parse_args()
 
     shape: Shape = args.shape or pick_shape()
@@ -175,101 +310,172 @@ def main() -> None:
                 num_episodes = int(raw)
                 break
             print("  Enter a positive integer.")
+
     logger = DataCollectionLogger(operator=args.operator)
 
-    print(f"\n{'=' * 52}")
+    print(f"\n{'=' * 56}")
     print(f"  MOSAIC Data Collection  —  {shape.upper()}")
-    print(f"{'=' * 52}")
+    print(f"{'=' * 56}")
     print(f"  Follower : {args.follower_port}  ({args.robot_id})")
     print(f"  Leader   : {args.leader_port}")
     print(f"  Cameras  : overhead={args.overhead_cam}  gripper={args.gripper_cam}")
-    print(
-        f"  Episode  : {args.episode_time}s  |  Reset: {args.reset_time}s  |  Target: {num_episodes} episodes"
-    )
+    print(f"  Episode  : {args.episode_time}s  |  Reset: {args.reset_time}s  |  Target: {num_episodes} eps")
+    print()
+    print("Hotkeys during recording:")
+    print("  k          → mark keyframe (KF1 first press, KF2 second press)")
+    print("  right →    → save episode")
+    print("  left  ←    → discard and re-record")
+    print("  Escape     → stop session")
     print()
     logger.print_progress()
 
-    print("Hotkeys during recording:")
-    print("  →  save episode      ←  discard & re-record      Esc  end session")
-    print()
+    robot_cfg = build_robot_config(
+        args.follower_port, args.robot_id, args.overhead_cam, args.gripper_cam, args.fps
+    )
+    teleop_cfg = build_teleop_config(args.leader_port)
+
+    robot = make_robot_from_config(robot_cfg)
+    teleop = make_teleoperator_from_config(teleop_cfg)
+
+    resume = Path(f"datasets/raw_{shape}").exists()
+    repo_id = f"{HF_USER}/mosaic_raw_{shape}"
+    single_task = f"Sort {shape} block"
+
+    teleop_action_processor_feat, _, robot_obs_processor = make_default_processors()
+
+    init_rerun(session_name="mosaic_data_collection")
+
+    robot.connect()
+    teleop.connect()
+
+    events = _make_events()
+    listener = _start_keyboard_listener(events)
+
+    dataset_features = combine_feature_dicts(
+        aggregate_pipeline_dataset_features(
+            pipeline=teleop_action_processor_feat,
+            initial_features=create_initial_features(action=robot.action_features),
+            use_videos=True,
+        ),
+        aggregate_pipeline_dataset_features(
+            pipeline=robot_obs_processor,
+            initial_features=create_initial_features(observation=robot.observation_features),
+            use_videos=True,
+        ),
+    )
+
+    if resume:
+        dataset = LeRobotDataset.resume(
+            repo_id,
+            root=f"datasets/raw_{shape}",
+            streaming_encoding=True,
+            encoder_threads=4,
+            image_writer_threads=4 * len(robot.cameras),
+        )
+        sanity_check_dataset_robot_compatibility(dataset, robot, args.fps, dataset_features)
+    else:
+        dataset = LeRobotDataset.create(
+            repo_id,
+            args.fps,
+            root=f"datasets/raw_{shape}",
+            robot_type=robot.name,
+            features=dataset_features,
+            use_videos=True,
+            image_writer_threads=4 * len(robot.cameras),
+            streaming_encoding=True,
+            encoder_threads=4,
+        )
 
     session_good = 0
 
-    for ep_num in range(1, num_episodes + 1):
-        count_before = dataset_episode_count(shape)
+    try:
+        with VideoEncodingManager(dataset):
+            recorded_episodes = 0
+            while recorded_episodes < num_episodes and not events["stop_recording"]:
+                count_before = dataset_episode_count(shape)
 
-        print(f"─── Episode {ep_num}/{num_episodes}  (dataset #{count_before + 1}) ──────────────────")
-        block_pos = input("Block position (e.g. 'left-center', 'far-right'): ").strip()
-        notes_pre = input("Pre-recording notes (Enter to skip): ").strip()
+                print(
+                    f"\n─── Episode {recorded_episodes + 1}/{num_episodes}  (dataset #{count_before + 1}) ───"
+                )
 
-        resume = Path(f"datasets/raw_{shape}").exists()
-        cmd = build_record_cmd(
-            shape=shape,
-            follower_port=args.follower_port,
-            leader_port=args.leader_port,
-            robot_id=args.robot_id,
-            overhead_cam=args.overhead_cam,
-            gripper_cam=args.gripper_cam,
-            fps=args.fps,
-            episode_time_s=args.episode_time,
-            reset_time_s=args.reset_time,
-            resume=resume,
-        )
+                log_say(f"Recording episode {dataset.num_episodes}", play_sounds=True)
+                keyframes = _record_episode(
+                    robot=robot,
+                    teleop=teleop,
+                    dataset=dataset,
+                    events=events,
+                    fps=args.fps,
+                    episode_time_s=args.episode_time,
+                    single_task=single_task,
+                    display_data=True,
+                )
 
-        print()
-        try:
-            subprocess.run(cmd, check=False)
-        except KeyboardInterrupt:
-            print("\nSession interrupted.")
-            break
+                if events["rerecord_episode"]:
+                    log_say("Re-record episode", play_sounds=True)
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    dataset.clear_episode_buffer()
+                    print("Episode discarded. Starting over.\n")
+                    continue
 
-        count_after = dataset_episode_count(shape)
-        if count_after <= count_before:
-            print("No episode saved — skipping log entry.\n")
-            cont = input("Try again? [Y/n]: ").strip().lower()
-            if cont == "n":
-                break
-            continue
+                if events["stop_recording"]:
+                    dataset.clear_episode_buffer()
+                    break
 
-        episode_id = count_after - 1
-        total_frames = read_last_episode_frames(shape) or 0
+                kf1 = keyframes[0] if len(keyframes) > 0 else 0
+                kf2 = keyframes[1] if len(keyframes) > 1 else 0
 
-        print(f"\nEpisode {episode_id} saved  ({total_frames} frames).  Rate this demo:")
-        quality = prompt_quality()
+                print(f"\nKeyframes captured: KF1={kf1}  KF2={kf2}")
+                if len(keyframes) < 2:
+                    print(
+                        f"  Warning: expected 2 keyframes, got {len(keyframes)}. "
+                        "Values missing will default to 0."
+                    )
 
-        print("  Keyframe frame indices (press Enter to skip):")
-        raw_kf1 = input("    KF1 — grasp done (arm at carry height): ").strip()
-        raw_kf2 = input("    KF2 — navigate done (arm above slot):   ").strip()
-        kf1 = int(raw_kf1) if raw_kf1.isdigit() else 0
-        kf2 = int(raw_kf2) if raw_kf2.isdigit() else 0
+                dataset.save_episode()
+                recorded_episodes += 1
 
-        notes_post = input("  Post-recording notes (Enter to skip): ").strip()
-        notes = " | ".join(filter(None, [notes_pre, notes_post]))
+                count_after = dataset_episode_count(shape)
+                episode_id = count_after - 1
+                total_frames = read_last_episode_frames(shape) or 0
 
-        logger.log_episode(
-            shape=shape,
-            episode_id=episode_id,
-            keyframe_1_frame=kf1,
-            keyframe_2_frame=kf2,
-            total_frames=total_frames,
-            duration_ms=total_frames * 1000 // args.fps if total_frames else args.episode_time * 1000,
-            block_position=block_pos,
-            quality=quality,
-            notes=notes,
-            dataset_path=f"datasets/raw_{shape}",
-        )
+                print(f"Episode {episode_id} saved  ({total_frames} frames)")
 
-        if quality == "good":
-            session_good += 1
+                logger.log_episode(
+                    shape=shape,
+                    episode_id=episode_id,
+                    keyframe_1_frame=kf1,
+                    keyframe_2_frame=kf2,
+                    total_frames=total_frames,
+                    duration_ms=total_frames * 1000 // args.fps if total_frames else args.episode_time * 1000,
+                    quality="good",
+                    dataset_path=f"datasets/raw_{shape}",
+                )
 
-        logger.print_progress()
+                session_good += 1
+                logger.print_progress()
 
-        if ep_num < num_episodes:
-            cont = input("Continue to next episode? [Y/n]: ").strip().lower()
-            if cont == "n":
-                print("Stopping early.")
-                break
-            print()
+                if not events["stop_recording"] and recorded_episodes < num_episodes:
+                    log_say("Reset the environment", play_sounds=True)
+                    _reset_window(
+                        robot=robot,
+                        teleop=teleop,
+                        events=events,
+                        fps=args.fps,
+                        reset_time_s=args.reset_time,
+                    )
+
+    finally:
+        log_say("Stop recording", play_sounds=True, blocking=True)
+        dataset.finalize()
+
+        if robot.is_connected:
+            robot.disconnect()
+        if teleop.is_connected:
+            teleop.disconnect()
+
+        if listener:
+            events["_kb_stop"] = True
 
     print(f"\nSession done. Good demos this session: {session_good}")
     logger.print_progress()

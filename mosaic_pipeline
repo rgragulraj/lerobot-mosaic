@@ -2,7 +2,7 @@
 
 ## What This Project Is
 
-MOSAIC (Modular Orchestrated Sub-Agent Architecture for Imitation-based Control) is a hierarchical multi-agent robotics system built as a first research paper. The task is shape sorting — a robot arm must find a block, pick it up, navigate to the correct slot based on its shape, and insert it. There are 4 shapes: circle, square, triangle, star.
+MOSAIC (Modular Orchestrated Sub-Agent Architecture for Imitation-based Control) is a hierarchical multi-agent robotics system built as a first research paper. The task is shape sorting — a robot arm must find a block, pick it up, navigate to the correct slot based on its shape, and insert it. There are 4 shapes: square, rectangle, star, cross.
 
 The core research contribution is the orchestrator and modular policy architecture. Instead of one end-to-end ACT policy trained on the full task, MOSAIC uses three specialized ACT policies sequenced by a GPT-4o orchestrator that can detect failures and replan. This is compared against a single end-to-end ACT baseline in evaluation.
 
@@ -156,7 +156,7 @@ All policies are trained using LeRobot's ACT implementation on the SO101. Observ
 - **Start state:** Arm at carry height holding block
 - **End state:** Arm positioned directly above the correct slot, ready to insert
 - **Why separate per shape:** Each shape has a different target slot position. Training separate policies avoids shape conditioning complexity and keeps each policy simple and focused.
-- **Checkpoints:** `checkpoints/navigate_circle/`, `checkpoints/navigate_square/`, `checkpoints/navigate_triangle/`, `checkpoints/navigate_star/`
+- **Checkpoints:** `checkpoints/navigate_square/`, `checkpoints/navigate_rectangle/`, `checkpoints/navigate_star/`, `checkpoints/navigate_cross/`
 
 ### Policy 3 — Insert Policy
 - **Trained on:** Frames KF2 → end from all 200 full episodes (all shapes)
@@ -174,7 +174,7 @@ This is the exact sequence of events during one MOSAIC trial.
 ### Phase 0 — Shape Identification
 1. Overhead camera captures one raw frame
 2. Frame sent to GPT-4V with shape classification prompt
-3. GPT-4V returns JSON: `{"shape": "triangle", "confidence": 0.95}`
+3. GPT-4V returns JSON: `{"shape": "cross", "confidence": 0.95}`
 4. Shape label stored — used later to route to correct navigate policy
 5. Latency: ~1-2 seconds, happens once per trial
 
@@ -193,7 +193,7 @@ This is the exact sequence of events during one MOSAIC trial.
 
 ### Phase 2 — Navigate to Slot
 1. Orchestrator calls `call_navigate_agent` tool with shape label
-2. Navigate agent loads the shape-specific ACT policy (e.g. navigate_triangle)
+2. Navigate agent loads the shape-specific ACT policy (e.g. navigate_cross)
 3. Policy runs full action chunk sequence
 4. Robot carries block from pickup position to above the correct slot
 5. **Success check:** GPT-4V takes one overhead frame and checks visually if the arm is positioned above the correct slot
@@ -280,9 +280,9 @@ Every trial writes a JSON log file to `outputs/logs/`. Schema:
   "trial_id": 42,
   "timestamp": "2025-05-08T14:23:11",
   "system": "mosaic",
-  "shape": "triangle",
+  "shape": "cross",
   "perception": {
-    "shape_detected": "triangle",
+    "shape_detected": "cross",
     "confidence": 0.95,
     "latency_ms": 1240
   },
@@ -321,7 +321,7 @@ Run 20 trials per shape for both MOSAIC and the single ACT baseline (80 trials e
 | Metric | Description |
 |---|---|
 | Overall task success rate | % trials where block correctly inserted |
-| Per-shape success rate | Breakdown by circle/square/triangle/star |
+| Per-shape success rate | Breakdown by square/rectangle/star/cross |
 | Recovery rate | % of failure cases where replanning led to success |
 | Average retries per trial | How often replanning was needed |
 | Average time to completion | Total ms including retries |

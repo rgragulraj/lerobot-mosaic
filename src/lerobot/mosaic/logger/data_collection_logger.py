@@ -6,10 +6,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-Shape = Literal["circle", "square", "triangle", "star"]
+Shape = Literal["square", "rectangle", "star", "cross"]
 Quality = Literal["good", "discard"]
 
-SHAPES: list[Shape] = ["circle", "square", "triangle", "star"]
+SHAPES: list[Shape] = ["square", "rectangle", "star", "cross"]
 TARGET_DEMOS_PER_SHAPE = 50
 
 

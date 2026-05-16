@@ -14,15 +14,18 @@ Usage:
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from lerobot.robots.so101_follower.config_so101_follower import SO101FollowerConfig
-from lerobot.robots.so101_follower.so101_follower import SO101Follower
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from lerobot.robots.so_follower.config_so_follower import SO101FollowerConfig
+from lerobot.robots.so_follower.so_follower import SOFollower as SO101Follower
 
 
 def capture(port: str, robot_id: str, name: str) -> None:
-    # No cameras needed for position capture
-    config = SO101FollowerConfig(port=port, id=robot_id)
+    config = SO101FollowerConfig(port=port)
+    config.id = robot_id
     robot = SO101Follower(config)
 
     # connect() loads calibration from ~/.cache/huggingface/lerobot/calibration/robots/so101_follower/<id>.json

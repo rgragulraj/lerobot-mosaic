@@ -125,52 +125,77 @@ def init_keyboard_listener():
     """
     Initializes a non-blocking keyboard listener for real-time user interaction.
 
-    This function sets up a listener for specific keys (right arrow, left arrow, escape) to control
-    the program flow during execution, such as stopping recording or exiting loops. It gracefully
-    handles headless environments where keyboard listening is not possible.
+    Uses raw terminal input via termios/select — works on both X11 and Wayland
+    without requiring pynput or special permissions.
 
     Returns:
         A tuple containing:
-        - The `pynput.keyboard.Listener` instance, or `None` if in a headless environment.
+        - A threading.Thread instance (or None if stdin is not a tty).
         - A dictionary of event flags (e.g., `exit_early`) that are set by key presses.
     """
-    # Allow to exit early while recording an episode or resetting the environment,
-    # by tapping the right arrow key '->'. This might require a sudo permission
-    # to allow your terminal to monitor keyboard events.
+    import select
+    import termios
+    import threading
+    import tty
+
     events = {}
     events["exit_early"] = False
     events["rerecord_episode"] = False
     events["stop_recording"] = False
+    events["keyframe_pressed"] = False
+    events["keyframes"] = []
+    events["_kb_stop"] = False
 
-    if is_headless():
-        logging.warning(
-            "Headless environment detected. On-screen cameras display and keyboard inputs will not be available."
-        )
-        listener = None
-        return listener, events
+    try:
+        tty_dev = open("/dev/tty", "rb", buffering=0)  # noqa: SIM115 - owned by background reader thread.
+        fd = tty_dev.fileno()
+        old_settings = termios.tcgetattr(fd)
+    except Exception:
+        logging.warning("Cannot open /dev/tty — keyboard input unavailable.")
+        return None, events
 
-    # Only import pynput if not in a headless environment
-    from pynput import keyboard
+    import atexit
 
-    def on_press(key):
+    atexit.register(lambda: termios.tcsetattr(fd, termios.TCSADRAIN, old_settings))
+
+    def read_keys():
+        tty.setraw(fd)
         try:
-            if key == keyboard.Key.right:
-                print("Right arrow key pressed. Exiting loop...")
-                events["exit_early"] = True
-            elif key == keyboard.Key.left:
-                print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
-                events["rerecord_episode"] = True
-                events["exit_early"] = True
-            elif key == keyboard.Key.esc:
-                print("Escape key pressed. Stopping data recording...")
-                events["stop_recording"] = True
-                events["exit_early"] = True
-        except Exception as e:
-            print(f"Error handling key press: {e}")
+            while not events["_kb_stop"]:
+                if not select.select([tty_dev], [], [], 0.05)[0]:
+                    continue
+                ch = tty_dev.read(1)
+                if ch == b"k":
+                    events.setdefault("keyframes", [])
+                    kf_num = len(events["keyframes"]) + 1
+                    events["keyframe_pressed"] = True
+                    print(f"  [k] Keyframe {kf_num} queued...")
+                elif ch == b"\x1b":
+                    if select.select([tty_dev], [], [], 0.5)[0]:
+                        ch2 = tty_dev.read(1)
+                        if ch2 == b"[" and select.select([tty_dev], [], [], 0.5)[0]:
+                            ch3 = tty_dev.read(1)
+                            if ch3 == b"C":
+                                print("Right arrow key pressed. Exiting loop...")
+                                events["exit_early"] = True
+                            elif ch3 == b"D":
+                                print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+                                events["rerecord_episode"] = True
+                                events["exit_early"] = True
+                        else:
+                            print("Escape key pressed. Stopping data recording...")
+                            events["stop_recording"] = True
+                            events["exit_early"] = True
+                    else:
+                        print("Escape key pressed. Stopping data recording...")
+                        events["stop_recording"] = True
+                        events["exit_early"] = True
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            tty_dev.close()
 
-    listener = keyboard.Listener(on_press=on_press)
+    listener = threading.Thread(target=read_keys, daemon=True)
     listener.start()
-
     return listener, events
 
 

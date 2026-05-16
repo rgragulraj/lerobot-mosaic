@@ -11,11 +11,14 @@ Usage:
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
-from lerobot.robots.so101_follower.config_so101_follower import SO101FollowerConfig
-from lerobot.robots.so101_follower.so101_follower import SO101Follower
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from lerobot.robots.so_follower.config_so_follower import SO101FollowerConfig
+from lerobot.robots.so_follower.so_follower import SOFollower as SO101Follower
 
 
 def go_to_start(port: str, robot_id: str, name: str, wait_s: float = 4.0) -> None:
@@ -30,7 +33,8 @@ def go_to_start(port: str, robot_id: str, name: str, wait_s: float = 4.0) -> Non
     target = payload["positions"]
     print(f"Loaded start position '{name}': {target}")
 
-    config = SO101FollowerConfig(port=port, id=robot_id, disable_torque_on_disconnect=False)
+    config = SO101FollowerConfig(port=port, disable_torque_on_disconnect=False)
+    config.id = robot_id
     robot = SO101Follower(config)
     robot.connect(calibrate=False)
     print(f"Connected to {port}.")
