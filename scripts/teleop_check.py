@@ -14,7 +14,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.processor import make_default_processors
 from lerobot.robots import (
     make_robot_from_config,
@@ -30,8 +29,6 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 FOLLOWER_PORT = "/dev/ttyACM0"
 LEADER_PORT = "/dev/ttyACM1"
-OVERHEAD_CAM_IDX = "/dev/video7"
-GRIPPER_CAM_IDX = "/dev/video5"
 FPS = 30
 
 
@@ -43,10 +40,7 @@ def main():
 
     robot_cfg = SO101FollowerConfig(
         port=FOLLOWER_PORT,
-        cameras={
-            "overhead": OpenCVCameraConfig(index_or_path=OVERHEAD_CAM_IDX, width=640, height=480, fps=FPS),
-            "gripper": OpenCVCameraConfig(index_or_path=GRIPPER_CAM_IDX, width=640, height=480, fps=FPS),
-        },
+        cameras={},
     )
     robot_cfg.id = "vellai_kunjan"
     teleop_cfg = SO101LeaderConfig(port=LEADER_PORT, id="my_leader_arm")

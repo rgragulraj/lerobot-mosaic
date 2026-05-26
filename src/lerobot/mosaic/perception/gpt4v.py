@@ -49,6 +49,18 @@ Respond ONLY with valid JSON in this exact format:
 
 Do not include any other text."""
 
+_GRASP_PROMPT = """You are a robotic arm task checker.
+The image shows a top-down view of a workspace.
+A robot arm is attempting to grasp a small block and lift it off the table.
+
+Task: Determine whether the robot arm has successfully grasped the block AND lifted it clearly off the table surface.
+Answer true only if the block is visibly raised above the table — not just touched or gripped while still resting flat.
+
+Respond ONLY with valid JSON in this exact format:
+{{"complete": true}} or {{"complete": false}}
+
+Do not include any other text."""
+
 
 class GPT4VClient:
     """GPT-4V vision client for shape classification and navigate success checks."""
@@ -103,6 +115,50 @@ class GPT4VClient:
         if result.get("shape") not in SHAPES:
             raise ValueError(f"GPT-4V returned unknown shape: {result.get('shape')!r}. Raw: {raw!r}")
 
+        result["latency_ms"] = latency_ms
+        return result
+
+    def check_grasp_complete(self, frame: np.ndarray) -> dict:
+        """Check if the robot has grasped and lifted the block off the table.
+
+        Args:
+            frame: Raw BGR frame from the overhead camera.
+
+        Returns:
+            {"complete": bool, "latency_ms": int}
+        """
+        t0 = time.monotonic()
+        image_b64 = _encode_frame(frame)
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _GRASP_PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}",
+                                "detail": "low",
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=32,
+            temperature=0,
+        )
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        raw = response.choices[0].message.content.strip()
+        result = _parse_json(raw)
+
+        if "complete" not in result:
+            raise ValueError(f"GPT-4V response missing 'complete' key. Raw: {raw!r}")
+
+        result["complete"] = bool(result["complete"])
         result["latency_ms"] = latency_ms
         return result
 

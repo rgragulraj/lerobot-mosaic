@@ -4,7 +4,7 @@
 # End:   arm positioned over the square slot, ready to insert — press right arrow
 # Controls: right arrow = save, left arrow = redo, ESC = finish
 
-uv run lerobot-record \
+lerobot-record \
     --robot.type=so101_follower \
     --robot.port=/dev/ttyACM0 \
     --robot.id=vellai_kunjan \
@@ -14,8 +14,8 @@ uv run lerobot-record \
     --teleop.id=my_leader_arm \
     --dataset.repo_id=rgragulraj/mosaic_navigate_square \
     --dataset.single_task="Navigate the square block to the insertion slot" \
-    --dataset.num_episodes=50 \
-    --dataset.episode_time_s=40 \
-    --dataset.reset_time_s=20 \
+    --dataset.num_episodes=30 \
+    --dataset.episode_time_s=60 \
+    --dataset.reset_time_s=30 \
     --dataset.push_to_hub=false \
     --display_data=true
