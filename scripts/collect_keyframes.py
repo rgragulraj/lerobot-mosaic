@@ -6,12 +6,14 @@ Press 'q' or Ctrl+C to stop.
 
 Usage:
     bash scripts/grasp_keyframe_rollout.sh
+    bash scripts/grasp_keyframe_rollout_star.sh  # uses --output-dir for star
 
 Output:
-    data/grasp_keyframes/done/NNNN_overhead.jpg
-    data/grasp_keyframes/done/NNNN_gripper.jpg
+    data/grasp_keyframes/done/NNNN_overhead.jpg       (default)
+    data/grasp_keyframes_star/done/NNNN_overhead.jpg  (with --output-dir)
 """
 
+import argparse
 import select
 import sys
 import termios
@@ -33,7 +35,12 @@ from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
 
-OUTPUT_DIR = Path("data/grasp_keyframes/done")
+_arg_parser = argparse.ArgumentParser(add_help=False)
+_arg_parser.add_argument("--output-dir", default="data/grasp_keyframes/done")
+_known, _remaining = _arg_parser.parse_known_args()
+sys.argv = [sys.argv[0]] + _remaining
+
+OUTPUT_DIR = Path(_known.output_dir)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 

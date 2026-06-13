@@ -1,26 +1,18 @@
-"""MOSAIC orchestrator — grasp → navigate → insert (square).
+"""MOSAIC orchestrator — grasp → navigate → insert (star).
 
-Phase 1 (grasp):
-  Runs grasp_square ACT policy. Every GRASP_CHECK_EVERY steps (after a warmup
-  window) compares the overhead frame to pre-collected done-keyframes using
-  ResNet18 cosine similarity. Stops when similarity >= GRASP_SIM_THRESHOLD or
-  after GRASP_MAX_STEPS.
+All three phases run for a fixed number of steps with no vision-based termination.
 
-Phase 2 (navigate):
-  Runs navigate_square ACT policy for a fixed number of steps (NAVIGATE_STEPS).
-
-Phase 3 (insert):
-  Runs insert_square ACT policy for a fixed number of steps (INSERT_STEPS).
-  Robot holds position after completion.
+Phase 1 (grasp):   GRASP_STEPS fixed steps.
+Phase 2 (navigate): NAVIGATE_STEPS fixed steps.
+Phase 3 (insert):   INSERT_STEPS fixed steps. Robot holds position after completion.
 
 Usage:
-    bash scripts/run_mosaic_square.sh
+    bash scripts/run_mosaic_star.sh
 
 Tuning:
-    GRASP_SIM_THRESHOLD  — lower (0.90) if never triggers; raise (0.99) if early
-    GRASP_SKIP_STEPS     — increase if robot hasn't started moving before first check
-    NAVIGATE_STEPS       — increase/decrease based on how long navigation takes
-    INSERT_STEPS         — increase/decrease based on how long insertion takes
+    GRASP_STEPS    — increase/decrease based on how long grasping takes
+    NAVIGATE_STEPS — increase/decrease based on how long navigation takes
+    INSERT_STEPS   — increase/decrease based on how long insertion takes
 """
 
 import sys
@@ -31,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.configs import parser
-from lerobot.mosaic.perception.grasp_done_detector import GraspDoneDetector
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.robots import so_follower  # noqa: F401
 from lerobot.rollout import RolloutConfig, build_rollout_context
@@ -42,16 +33,11 @@ from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
 
-GRASP_CHECKPOINT = Path("outputs/train/act_mosaic_grasp_square/checkpoints/020000/pretrained_model")
-NAVIGATE_CHECKPOINT = Path("outputs/train/act_mosaic_navigate_square/checkpoints/020000/pretrained_model")
-INSERT_CHECKPOINT = Path("outputs/train/act_mosaic_insert_square/checkpoints/020000/pretrained_model")
-DONE_KEYFRAMES_DIR = Path("data/grasp_keyframes/done")
+GRASP_CHECKPOINT = Path("outputs/train/act_mosaic_grasp_star/checkpoints/020000/pretrained_model")
+NAVIGATE_CHECKPOINT = Path("outputs/train/act_mosaic_navigate_star/checkpoints/020000/pretrained_model")
+INSERT_CHECKPOINT = Path("outputs/train/act_mosaic_insert_star/checkpoints/020000/pretrained_model")
 
-GRASP_SKIP_STEPS = 300
-GRASP_CHECK_EVERY = 20
-GRASP_MAX_STEPS = 600
-GRASP_SIM_THRESHOLD = 0.75
-
+GRASP_STEPS = 400
 NAVIGATE_STEPS = 300
 INSERT_STEPS = 200
 FPS = 30
@@ -98,12 +84,9 @@ def _build_engine(checkpoint: Path, ctx, cfg, shutdown_event):
 def run(cfg: RolloutConfig):
     init_logging()
 
-    detector = GraspDoneDetector(DONE_KEYFRAMES_DIR, threshold=GRASP_SIM_THRESHOLD)
-
     signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
     shutdown_event = signal_handler.shutdown_event
 
-    # Build context with grasp policy (also connects the robot)
     ctx = build_rollout_context(cfg, shutdown_event)
     control_interval = 1.0 / cfg.fps
 
@@ -113,14 +96,11 @@ def run(cfg: RolloutConfig):
     grasp_engine.start()
     grasp_engine.resume()
 
-    grasp_done = False
-
     try:
         # ── Phase 1: Grasp ────────────────────────────────────────────────────
-        print(f"\n=== PHASE 1: GRASP (max {GRASP_MAX_STEPS} steps) ===")
-        print(f"Similarity checks start at step {GRASP_SKIP_STEPS}, threshold={GRASP_SIM_THRESHOLD}\n")
+        print(f"\n=== PHASE 1: GRASP ({GRASP_STEPS} steps) ===\n")
 
-        for step in range(GRASP_MAX_STEPS):
+        for _step in range(GRASP_STEPS):
             if shutdown_event.is_set():
                 break
 
@@ -130,23 +110,10 @@ def run(cfg: RolloutConfig):
             obs_processed = ctx.processors.robot_observation_processor(obs_raw)
             send_next_action(obs_processed, obs_raw, ctx, interpolator)
 
-            if step >= GRASP_SKIP_STEPS and step % GRASP_CHECK_EVERY == 0:
-                overhead = obs_raw.get("overhead")
-                if overhead is not None:
-                    done, sim = detector.is_done(overhead)
-                    print(f"  [step {step:3d}] similarity={sim:.3f}{'  ← DONE' if done else ''}")
-                    if done:
-                        grasp_done = True
-                        break
-
             precise_sleep(max(0.0, control_interval - (time.perf_counter() - loop_start)))
 
         grasp_engine.stop()
-
-        if grasp_done:
-            print("\nGrasp done! Moving to navigate phase...")
-        else:
-            print(f"\nMax steps ({GRASP_MAX_STEPS}) reached — proceeding to navigate anyway.")
+        print("\nGrasp done. Moving to navigate phase...")
 
         # ── Phase 2: Navigate ─────────────────────────────────────────────────
         print(f"\n=== PHASE 2: NAVIGATE ({NAVIGATE_STEPS} steps) ===\n")
@@ -154,7 +121,6 @@ def run(cfg: RolloutConfig):
         nav_engine = _build_engine(NAVIGATE_CHECKPOINT, ctx, cfg, shutdown_event)
         nav_interpolator = ActionInterpolator(multiplier=cfg.interpolation_multiplier)
 
-        # Swap ctx.policy.inference so send_next_action uses the navigate engine
         ctx.policy.inference = nav_engine
         nav_engine.reset()
         nav_engine.start()
@@ -176,7 +142,7 @@ def run(cfg: RolloutConfig):
         print("\nNavigate done. Moving to insert phase...")
 
         # ── Phase 3: Insert ───────────────────────────────────────────────────
-        print(f"\n=== PHASE 3: INSERT ({INSERT_STEPS} steps) ===\n")
+        print("\n=== PHASE 3: INSERT (running until Ctrl+C) ===\n")
 
         insert_engine = _build_engine(INSERT_CHECKPOINT, ctx, cfg, shutdown_event)
         insert_interpolator = ActionInterpolator(multiplier=cfg.interpolation_multiplier)
@@ -186,10 +152,7 @@ def run(cfg: RolloutConfig):
         insert_engine.start()
         insert_engine.resume()
 
-        for _step in range(INSERT_STEPS):
-            if shutdown_event.is_set():
-                break
-
+        while not shutdown_event.is_set():
             loop_start = time.perf_counter()
 
             obs_raw = ctx.hardware.robot_wrapper.get_observation()
@@ -199,7 +162,7 @@ def run(cfg: RolloutConfig):
             precise_sleep(max(0.0, control_interval - (time.perf_counter() - loop_start)))
 
         insert_engine.stop()
-        print("\nInsert done. Holding position.")
+        print("\nInsert stopped.")
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
