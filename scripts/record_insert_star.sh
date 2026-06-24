@@ -13,9 +13,11 @@ lerobot-record \
     --teleop.port=/dev/ttyACM1 \
     --teleop.id=my_leader_arm \
     --dataset.repo_id=rgragulraj/mosaic_insert_star \
+    --dataset.root="${HOME}/.cache/huggingface/lerobot/rgragulraj/mosaic_insert_star_20260612_191647" \
     --dataset.single_task="Insert the star block into the slot" \
     --dataset.num_episodes=25 \
     --dataset.episode_time_s=30 \
     --dataset.reset_time_s=20 \
     --dataset.push_to_hub=false \
+    --resume=true \
     --display_data=true

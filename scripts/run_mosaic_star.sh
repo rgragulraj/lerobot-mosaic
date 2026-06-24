@@ -2,7 +2,7 @@
 # Run MOSAIC star pipeline: grasp → navigate.
 # Collect star grasp done-keyframes first into data/grasp_keyframes_star/done/
 
-uv run python scripts/run_mosaic_star.py \
+python scripts/run_mosaic_star.py \
     --robot.type=so101_follower \
     --robot.port=/dev/ttyACM0 \
     --robot.id=vellai_kunjan \

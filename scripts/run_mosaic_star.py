@@ -35,7 +35,7 @@ from lerobot.utils.utils import init_logging
 
 GRASP_CHECKPOINT = Path("outputs/train/act_mosaic_grasp_star/checkpoints/020000/pretrained_model")
 NAVIGATE_CHECKPOINT = Path("outputs/train/act_mosaic_navigate_star/checkpoints/020000/pretrained_model")
-INSERT_CHECKPOINT = Path("outputs/train/act_mosaic_insert_star/checkpoints/020000/pretrained_model")
+INSERT_CHECKPOINT = Path("outputs/train/diffusion_mosaic_insert_star/checkpoints/020000/pretrained_model")
 
 GRASP_STEPS = 400
 NAVIGATE_STEPS = 300
@@ -43,10 +43,10 @@ INSERT_STEPS = 200
 FPS = 30
 
 
-def _build_engine(checkpoint: Path, ctx, cfg, shutdown_event):
+def _build_engine(checkpoint: Path, ctx, cfg, shutdown_event, policy_type: str = "act"):
     """Load a policy from checkpoint and wire it to the existing hardware context."""
-    print(f"Loading policy from {checkpoint} ...")
-    policy_class = get_policy_class("act")
+    print(f"Loading {policy_type} policy from {checkpoint} ...")
+    policy_class = get_policy_class(policy_type)
     policy = policy_class.from_pretrained(str(checkpoint))
     policy = policy.to(cfg.device)
     policy.eval()
@@ -144,7 +144,7 @@ def run(cfg: RolloutConfig):
         # ── Phase 3: Insert ───────────────────────────────────────────────────
         print("\n=== PHASE 3: INSERT (running until Ctrl+C) ===\n")
 
-        insert_engine = _build_engine(INSERT_CHECKPOINT, ctx, cfg, shutdown_event)
+        insert_engine = _build_engine(INSERT_CHECKPOINT, ctx, cfg, shutdown_event, policy_type="diffusion")
         insert_interpolator = ActionInterpolator(multiplier=cfg.interpolation_multiplier)
 
         ctx.policy.inference = insert_engine
