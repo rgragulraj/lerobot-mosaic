@@ -3,11 +3,11 @@
   "robot_id": "vellai_kunjan",
   "port": "/dev/ttyACM0",
   "positions": {
-    "shoulder_pan": -0.03721622627466559,
-    "shoulder_lift": -1.6501650165016457,
-    "elbow_flex": 9.432234432234438,
-    "wrist_flex": 93.37064141196728,
-    "wrist_roll": 3.498694516971284,
-    "gripper": 10.761154855643044
+    "shoulder_pan": -4.747252747252747,
+    "shoulder_lift": 5.406593406593407,
+    "elbow_flex": -2.769230769230769,
+    "wrist_flex": 97.62637362637362,
+    "wrist_roll": -6.197802197802198,
+    "gripper": 11.394891944990176
   }
 }

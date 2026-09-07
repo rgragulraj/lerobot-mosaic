@@ -1,0 +1,23 @@
+{
+  "name": "blackstarinsert",
+  "robot_id": "vellai_kunjan",
+  "port": "/dev/ttyACM0",
+  "positions": {
+    "shoulder_pan": -6.1588,
+    "shoulder_lift": 9.1299,
+    "elbow_flex": -4.3163,
+    "wrist_flex": 99.2228,
+    "wrist_roll": -8.0419,
+    "gripper": 8.7008
+  },
+  "_meta": {
+    "source_dataset": "rgragulraj/blackstarinsertion",
+    "samples_total": 25,
+    "samples_in_group": 25,
+    "method": "geometric median (Weiszfeld) of the single DBSCAN cluster (eps=8.71, min_samples=3) over frame-0 observation.state of all 25 episodes",
+    "coordinate_wise_median": [-6.154, 9.275, -4.440, 99.824, -8.484, 8.841],
+    "geometric_median": [-6.1588, 9.1299, -4.3163, 99.2228, -8.0419, 8.7008],
+    "outliers_removed": [],
+    "notes": "k-NN distance curve has no knee; eps>=4.5 yields one cluster with 0-2 noise. No distinct start-position sub-groups."
+  }
+}
